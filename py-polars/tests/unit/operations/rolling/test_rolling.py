@@ -2576,3 +2576,29 @@ def test_min_periods_removed() -> None:
 
     with pytest.raises(ArgumentRemovedError, match=re.escape(msg)):
         pl.rolling_corr("a", "b", window_size=2, min_periods=1)  # type: ignore[call-arg]
+
+
+def test_rolling_non_monotone_window_boundaries_29496() -> None:
+    # With calendrical offsets the window bounds may not be monotone even though
+    # the index is sorted (month clamping moves the second window's lower bound
+    # backwards). Rolling must not dispatch the specialised kernels (which
+    # assume monotonicity) in that case.
+    df = pl.DataFrame(
+        {
+            "t": [
+                datetime(2025, 1, 30, 12),
+                datetime(2025, 1, 31, 1),
+                datetime(2025, 2, 28, 6),
+            ],
+            "v": [0, 1, 2],
+        }
+    ).set_sorted("t")
+
+    result = df.rolling("t", offset="1mo", period="1d", closed="right").agg(
+        pl.col("v").sum()
+    )
+    # Window bounds: (2025-02-28 12:00, 2025-03-01 12:00],
+    # (2025-02-28 01:00, 2025-03-01 01:00] (contains row 2),
+    # (2025-03-28 06:00, 2025-03-29 06:00].
+    expected = df.with_columns(v=pl.Series([0, 2, 0], dtype=pl.Int64))
+    assert_frame_equal(result, expected)

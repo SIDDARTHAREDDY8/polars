@@ -350,7 +350,12 @@ impl Wrap<&DataFrame> {
 
             let groups = RAYON.install(|| iter.collect::<PolarsResult<Vec<_>>>())?;
             let groups = RAYON.install(|| flatten_par(&groups));
-            let groups = GroupsType::new_slice(groups, true, true);
+            // With calendrical offsets (month clamping, DST) the window bounds may
+            // not be monotone even though the index is sorted. The specialised
+            // rolling kernels assume monotonicity, so like `group_by_dynamic` we
+            // must compute the flag rather than asserting it.
+            let monotonic = slice_groups_are_monotonic(&groups);
+            let groups = GroupsType::new_slice(groups, true, monotonic);
             Ok((dt, groups.into_sliceable()))
         } else {
             // a requirement for the index
@@ -373,7 +378,12 @@ impl Wrap<&DataFrame> {
                 tz,
                 rows.clone(),
             )?;
-            let groups = GroupsType::new_slice(groups, true, true);
+            // With calendrical offsets (month clamping, DST) the window bounds may
+            // not be monotone even though the index is sorted. The specialised
+            // rolling kernels assume monotonicity, so like `group_by_dynamic` we
+            // must compute the flag rather than asserting it.
+            let monotonic = slice_groups_are_monotonic(&groups);
+            let groups = GroupsType::new_slice(groups, true, monotonic);
             let dt = dt.slice(rows.start as i64, rows.len());
             Ok((dt, groups.into_sliceable()))
         }
@@ -524,6 +534,73 @@ mod test {
         let quantile = unsafe { nulls.agg_quantile(&groups, 0.5, QuantileMethod::Linear) };
         let expected = Series::new("".into(), [3.0, 5.0, 5.0, 7.0, 5.5, 1.0]);
         assert_eq!(quantile, expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_rolling_group_by_non_monotone_windows() -> PolarsResult<()> {
+        // https://github.com/pola-rs/polars/issues/29496
+        // With calendrical offsets the window bounds may not be monotone even
+        // though the index is sorted (here month clamping moves the lower bound
+        // of the second window backwards). `rolling` must flag the groups as
+        // non-monotone so the specialised rolling kernels (which assume
+        // monotonicity) are not dispatched.
+        let mut date = StringChunked::new(
+            "dt".into(),
+            [
+                "2025-01-30 12:00:00",
+                "2025-01-31 01:00:00",
+                "2025-02-28 06:00:00",
+            ],
+        )
+        .as_datetime(
+            None,
+            TimeUnit::Microseconds,
+            false,
+            false,
+            None,
+            &StringChunked::from_iter(std::iter::once("raise")),
+        )?
+        .into_column();
+        date.set_sorted_flag(IsSorted::Ascending);
+        let a = Column::new("a".into(), [0, 1, 2]);
+        let df = DataFrame::new_infer_height(vec![date, a.clone()])?;
+
+        let options = RollingGroupOptionsIR {
+            index_column: "dt".into(),
+            period: Duration::parse("1d"),
+            offset: Duration::parse("1mo"),
+            closed_window: ClosedWindow::Right,
+            placement: None,
+        };
+        let (_, groups) = df.rolling(None, &options).unwrap();
+
+        // The window of the second row starts earlier than the window of the
+        // first row, so the groups must not be marked as monotone.
+        match groups.as_ref() {
+            GroupsType::Slice {
+                groups: slices,
+                monotonic,
+                ..
+            } => {
+                assert!(!slice_groups_are_monotonic(slices));
+                assert!(!monotonic);
+                // Window bounds:
+                // - row 0: (2025-02-28 12:00, 2025-03-01 12:00] -> empty
+                // - row 1: (2025-02-28 01:00, 2025-03-01 01:00] -> [row 2]
+                // - row 2: (2025-03-28 06:00, 2025-03-29 06:00] -> empty
+                assert_eq!(slices.len(), 3);
+                assert_eq!(slices[0][1], 0);
+                assert_eq!(slices[1], [2, 1]);
+                assert_eq!(slices[2][1], 0);
+            }
+            _ => panic!("expected slice groups"),
+        }
+
+        let sum = unsafe { a.agg_sum(&groups) };
+        let expected = Column::new("".into(), [0, 2, 0]);
+        assert_eq!(sum, expected);
 
         Ok(())
     }
